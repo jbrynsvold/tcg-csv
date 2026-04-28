@@ -4,15 +4,16 @@ tcgcsv_ingest.py
 Daily ingest of TCGplayer prices via TCGCSV.com into Supabase.
 
 Flow:
-  1. Load active games from tcgcsv_sync_config
-  2. For each game, fetch Groups.csv to discover all set IDs dynamically
-  3. Download each group's ProductsAndPrices.csv (async, 20 concurrent)
-  4. Upsert products → tcgcsv_products (skip if modified_on unchanged)
-  5. Upsert prices  → tcgcsv_prices_latest (always overwrite)
-  6. Insert prices  → tcgcsv_prices_history (on conflict do nothing)
-  7. Purge history older than 30 days (preserve checkpoints)
-  8. On 1st of month: mark yesterday as checkpoint before purge
-  9. Log run stats to tcgcsv_sync_log
+  1. Check last-updated.txt — skip if already synced today
+  2. Load active games from tcgcsv_sync_config
+  3. For each game, fetch Groups.csv to discover all set IDs dynamically
+  4. Download each group's ProductsAndPrices.csv (async, 20 concurrent)
+  5. Upsert products → tcgcsv_products (skip if modified_on unchanged)
+  6. Upsert prices  → tcgcsv_prices_latest (always overwrite)
+  7. Insert prices  → tcgcsv_prices_history (on conflict do nothing)
+  8. Purge history older than 30 days (preserve checkpoints)
+  9. On 1st of month: mark yesterday as checkpoint before purge
+ 10. Log run stats to tcgcsv_sync_log
 
 Environment variables required:
   SUPABASE_URL
@@ -36,10 +37,13 @@ from supabase import create_client, Client
 SUPABASE_URL        = os.environ["SUPABASE_URL"]
 SUPABASE_KEY        = os.environ["SUPABASE_SERVICE_KEY"]
 TCGCSV_BASE         = "https://tcgcsv.com/tcgplayer"
+TCGCSV_LAST_UPDATED = "https://tcgcsv.com/last-updated.txt"
 CONCURRENT_REQUESTS = 20
 BATCH_SIZE          = 500          # rows per Supabase upsert call
 HISTORY_DAYS        = 30           # rolling window before purge
 REQUEST_TIMEOUT     = 30           # seconds per HTTP request
+REQUEST_SLEEP       = 0.10         # 100ms sleep per TCGCSV usage guidelines
+USER_AGENT          = "GIGA/1.0.0" # required by TCGCSV usage guidelines
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +61,7 @@ def get_supabase() -> Client:
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 async def fetch_csv(session: aiohttp.ClientSession, url: str) -> pd.DataFrame | None:
     """Fetch a CSV URL and return a DataFrame, or None on failure."""
+    await asyncio.sleep(REQUEST_SLEEP)  # 100ms between requests per usage guidelines
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
             if resp.status != 200:
@@ -69,9 +74,53 @@ async def fetch_csv(session: aiohttp.ClientSession, url: str) -> pd.DataFrame | 
         return None
 
 
+async def check_last_updated(session: aiohttp.ClientSession, supabase: Client) -> bool:
+    """
+    Check TCGCSV's last-updated.txt against our most recent successful sync.
+    Returns True if we should proceed, False if already up to date.
+    """
+    try:
+        async with session.get(
+            TCGCSV_LAST_UPDATED,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                log.warning("Could not fetch last-updated.txt — proceeding anyway")
+                return True
+            remote_ts = (await resp.text()).strip()
+            log.info(f"TCGCSV last updated: {remote_ts}")
+    except Exception as e:
+        log.warning(f"last-updated.txt check failed: {e} — proceeding anyway")
+        return True
+
+    # Check our most recent successful sync timestamp
+    result = supabase.table("tcgcsv_sync_log") \
+        .select("created_at") \
+        .eq("status", "success") \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if not result.data:
+        log.info("No previous successful sync found — proceeding")
+        return True
+
+    last_sync = result.data[0]["created_at"]
+    log.info(f"Our last successful sync: {last_sync}")
+
+    # Store remote_ts in sync_log notes for next comparison
+    # Simple check: if remote_ts timestamp is newer than our last sync, proceed
+    if remote_ts > last_sync[:len(remote_ts)]:
+        log.info("TCGCSV has newer data — proceeding with sync")
+        return True
+    else:
+        log.info("Already up to date — skipping sync")
+        return False
+
+
 # ── Supabase upsert helpers ───────────────────────────────────────────────────
 def upsert_batched(supabase: Client, table: str, rows: list[dict],
-                   conflict_cols: str, update_cols: list[str] | None = None) -> int:
+                   conflict_cols: str) -> int:
     """Upsert rows in batches of BATCH_SIZE. Returns total rows processed."""
     if not rows:
         return 0
@@ -90,7 +139,6 @@ def insert_ignore_batched(supabase: Client, table: str, rows: list[dict]) -> int
     total = 0
     for i in range(0, len(rows), BATCH_SIZE):
         batch = rows[i : i + BATCH_SIZE]
-        # ignoreDuplicates=True maps to ON CONFLICT DO NOTHING
         supabase.table(table).upsert(
             batch,
             on_conflict="product_id,sub_type,price_date",
@@ -143,9 +191,8 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
         if not product_id or not group_id:
             continue
 
-        # Skip rows with no subTypeName AND no prices — these are dead listings
+        # Skip rows with no subTypeName AND no prices — dead listings
         # (code cards, unlisted blisters) that will never have market data.
-        # Rows with a real subTypeName are always kept even if prices are temporarily null.
         if sub_type_raw is None:
             price_vals = [row.get(c) for c in ("lowPrice", "midPrice", "highPrice", "marketPrice", "directLowPrice")]
             if all(safe_numeric(v) is None for v in price_vals):
@@ -156,33 +203,33 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
 
         # ── product record ──
         product_rows.append({
-            "product_id":   product_id,
-            "sub_type":     sub_type,
-            "category_id":  category_id,
-            "group_id":     group_id,
-            "name":         safe_str(row.get("name")),
-            "clean_name":   safe_str(row.get("cleanName")),
-            "ext_number":   safe_str(row.get("extNumber")),
-            "ext_rarity":   safe_str(row.get("extRarity")),
-            "ext_card_type":safe_str(row.get("extCardType")),
-            "ext_hp":       safe_str(row.get("extHP")),
-            "ext_stage":    safe_str(row.get("extStage")),
-            "image_url":    safe_str(row.get("imageUrl")),
-            "tcgcsv_url":   safe_str(row.get("url")),
-            "modified_on":  safe_str(row.get("modifiedOn")),
-            "updated_at":   "now()",
+            "product_id":    product_id,
+            "sub_type":      sub_type,
+            "category_id":   category_id,
+            "group_id":      group_id,
+            "name":          safe_str(row.get("name")),
+            "clean_name":    safe_str(row.get("cleanName")),
+            "ext_number":    safe_str(row.get("extNumber")),
+            "ext_rarity":    safe_str(row.get("extRarity")),
+            "ext_card_type": safe_str(row.get("extCardType")),
+            "ext_hp":        safe_str(row.get("extHP")),
+            "ext_stage":     safe_str(row.get("extStage")),
+            "image_url":     safe_str(row.get("imageUrl")),
+            "tcgcsv_url":    safe_str(row.get("url")),
+            "modified_on":   safe_str(row.get("modifiedOn")),
+            "updated_at":    "now()",
         })
 
         # ── price records ──
         price = {
-            "product_id":  product_id,
-            "sub_type":    sub_type,
-            "low_price":   safe_numeric(row.get("lowPrice")),
-            "mid_price":   safe_numeric(row.get("midPrice")),
-            "high_price":  safe_numeric(row.get("highPrice")),
-            "market_price":safe_numeric(row.get("marketPrice")),
-            "direct_low":  safe_numeric(row.get("directLowPrice")),
-            "price_date":  str(today),
+            "product_id":   product_id,
+            "sub_type":     sub_type,
+            "low_price":    safe_numeric(row.get("lowPrice")),
+            "mid_price":    safe_numeric(row.get("midPrice")),
+            "high_price":   safe_numeric(row.get("highPrice")),
+            "market_price": safe_numeric(row.get("marketPrice")),
+            "direct_low":   safe_numeric(row.get("directLowPrice")),
+            "price_date":   str(today),
         }
 
         latest_rows.append({**price, "updated_at": "now()"})
@@ -262,16 +309,16 @@ async def process_game(
     # ── Upsert to Supabase ──
     upsert_batched(supabase, "tcgcsv_products",      all_products, "product_id,sub_type")
     upsert_batched(supabase, "tcgcsv_prices_latest", all_latest,   "product_id,sub_type")
-    inserted = insert_ignore_batched(supabase, "tcgcsv_prices_history", all_history)
+    insert_ignore_batched(supabase, "tcgcsv_prices_history", all_history)
 
-    log_entry["rows_upserted"] = len(all_latest)
+    log_entry["rows_upserted"]    = len(all_latest)
     log_entry["duration_seconds"] = round(time.time() - t0, 1)
-    log_entry["status"] = "success"
+    log_entry["status"]           = "success"
 
     # ── Update last_synced_at in config ──
     supabase.table("tcgcsv_sync_config").update({
         "last_synced_at": "now()",
-        "group_count": len(group_ids),
+        "group_count":    len(group_ids),
     }).eq("category_id", category_id).execute()
 
     log.info(f"  [{game_name}] done in {log_entry['duration_seconds']}s")
@@ -279,29 +326,24 @@ async def process_game(
 
 
 # ── History maintenance ───────────────────────────────────────────────────────
-def maintain_history(supabase: Client, today: date) -> int:
+def maintain_history(supabase: Client, today: date) -> None:
     """
     1. On 1st of month: mark yesterday's rows as monthly checkpoints.
     2. Delete rows older than HISTORY_DAYS that are not checkpoints.
-    Returns count of purged rows (approximate — Supabase doesn't return delete count easily).
     """
-    yesterday  = today - timedelta(days=1)
-    cutoff     = today - timedelta(days=HISTORY_DAYS)
+    yesterday = today - timedelta(days=1)
+    cutoff    = today - timedelta(days=HISTORY_DAYS)
 
-    # Monthly checkpoint
     if today.day == 1:
         log.info(f"  Marking {yesterday} as monthly checkpoint...")
         supabase.table("tcgcsv_prices_history").update({"is_checkpoint": True}).eq(
             "price_date", str(yesterday)
         ).eq("is_checkpoint", False).execute()
 
-    # Purge old non-checkpoint rows
     log.info(f"  Purging history older than {cutoff} (non-checkpoints)...")
     supabase.table("tcgcsv_prices_history").delete().lt(
         "price_date", str(cutoff)
     ).eq("is_checkpoint", False).execute()
-
-    return 0  # Supabase REST doesn't return delete row count
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -311,19 +353,28 @@ async def main():
 
     log.info(f"=== TCGCSV ingest starting — {today} ===")
 
-    # Load active games ordered by priority
-    config_resp = (
-        supabase.table("tcgcsv_sync_config")
-        .select("category_id, game_name")
-        .eq("is_active", True)
-        .order("sync_priority")
-        .execute()
-    )
-    games = config_resp.data
-    log.info(f"Active games: {[g['game_name'] for g in games]}")
-
+    headers   = {"User-Agent": USER_AGENT}
     connector = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS + 5)
-    async with aiohttp.ClientSession(connector=connector) as session:
+
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+
+        # ── Check if TCGCSV has new data since our last sync ──
+        should_sync = await check_last_updated(session, supabase)
+        if not should_sync:
+            log.info("Nothing to do — exiting.")
+            return
+
+        # ── Load active games ordered by priority ──
+        config_resp = (
+            supabase.table("tcgcsv_sync_config")
+            .select("category_id, game_name")
+            .eq("is_active", True)
+            .order("sync_priority")
+            .execute()
+        )
+        games = config_resp.data
+        log.info(f"Active games: {[g['game_name'] for g in games]}")
+
         for game in games:
             log.info(f"\n── {game['game_name']} (cat {game['category_id']}) ──")
             try:
@@ -344,7 +395,7 @@ async def main():
 
             supabase.table("tcgcsv_sync_log").insert(log_entry).execute()
 
-    # History maintenance after all games done
+    # ── History maintenance after all games done ──
     log.info("\n── History maintenance ──")
     maintain_history(supabase, today)
 

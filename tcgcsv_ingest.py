@@ -135,12 +135,21 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
         return [], [], []
 
     for _, row in df.iterrows():
-        product_id = safe_str(row.get("productId"))
-        sub_type   = safe_str(row.get("subTypeName")) or "Normal"
-        group_id   = safe_str(row.get("groupId"))
+        product_id   = safe_str(row.get("productId"))
+        sub_type_raw = safe_str(row.get("subTypeName"))
+        sub_type     = sub_type_raw or "Normal"
+        group_id     = safe_str(row.get("groupId"))
 
         if not product_id or not group_id:
             continue
+
+        # Skip rows with no subTypeName AND no prices — these are dead listings
+        # (code cards, unlisted blisters) that will never have market data.
+        # Rows with a real subTypeName are always kept even if prices are temporarily null.
+        if sub_type_raw is None:
+            price_vals = [row.get(c) for c in ("lowPrice", "midPrice", "highPrice", "marketPrice", "directLowPrice")]
+            if all(safe_numeric(v) is None for v in price_vals):
+                continue
 
         product_id = int(product_id)
         group_id   = int(group_id)

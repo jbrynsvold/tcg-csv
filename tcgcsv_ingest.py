@@ -8,12 +8,11 @@ Flow:
   2. Load active games from tcgcsv_sync_config
   3. For each game, fetch Groups.csv to discover all set IDs dynamically
   4. Download each group's ProductsAndPrices.csv (async, 20 concurrent)
-  5. Upsert products → tcgcsv_products (skip if modified_on unchanged)
-  6. Upsert prices  → tcgcsv_prices_latest (always overwrite)
-  7. Insert prices  → tcgcsv_prices_history (on conflict do nothing)
-  8. Purge history older than 30 days (preserve checkpoints)
-  9. On 1st of month: mark yesterday as checkpoint before purge
- 10. Log run stats to tcgcsv_sync_log
+  5. Upsert products → tcgcsv_products
+  6. Shift price columns → tcgcsv_prices_wide (d1→d2, d2→d3 ... d28→d29)
+  7. Write today's 5 price fields → tcgcsv_prices_wide
+  8. On 1st of month: add new checkpoint column + populate from market_d1
+  9. Log run stats to tcgcsv_sync_log
 
 Environment variables required:
   SUPABASE_URL
@@ -39,11 +38,10 @@ SUPABASE_KEY        = os.environ["SUPABASE_SERVICE_KEY"]
 TCGCSV_BASE         = "https://tcgcsv.com/tcgplayer"
 TCGCSV_LAST_UPDATED = "https://tcgcsv.com/last-updated.txt"
 CONCURRENT_REQUESTS = 20
-BATCH_SIZE          = 500          # rows per Supabase upsert call
-HISTORY_DAYS        = 30           # rolling window before purge
-REQUEST_TIMEOUT     = 30           # seconds per HTTP request
-REQUEST_SLEEP       = 0.10         # 100ms sleep per TCGCSV usage guidelines
-USER_AGENT          = "GIGA/1.0.0" # required by TCGCSV usage guidelines
+BATCH_SIZE          = 500
+REQUEST_TIMEOUT     = 30
+REQUEST_SLEEP       = 0.10         # 100ms between requests per usage guidelines
+USER_AGENT          = "GIGA/1.0.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +49,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# Rolling day columns d1-d29 (d1 = yesterday, d29 = 29 days ago)
+DAY_COLS = [f"market_d{i}" for i in range(1, 30)]
 
 
 # ── Supabase client ───────────────────────────────────────────────────────────
@@ -60,8 +61,7 @@ def get_supabase() -> Client:
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 async def fetch_csv(session: aiohttp.ClientSession, url: str) -> pd.DataFrame | None:
-    """Fetch a CSV URL and return a DataFrame, or None on failure."""
-    await asyncio.sleep(REQUEST_SLEEP)  # 100ms between requests per usage guidelines
+    await asyncio.sleep(REQUEST_SLEEP)
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
             if resp.status != 200:
@@ -75,10 +75,6 @@ async def fetch_csv(session: aiohttp.ClientSession, url: str) -> pd.DataFrame | 
 
 
 async def check_last_updated(session: aiohttp.ClientSession, supabase: Client) -> bool:
-    """
-    Check TCGCSV's last-updated.txt against our most recent successful sync.
-    Returns True if we should proceed, False if already up to date.
-    """
     try:
         async with session.get(
             TCGCSV_LAST_UPDATED,
@@ -93,7 +89,6 @@ async def check_last_updated(session: aiohttp.ClientSession, supabase: Client) -
         log.warning(f"last-updated.txt check failed: {e} — proceeding anyway")
         return True
 
-    # Check our most recent successful sync timestamp
     result = supabase.table("tcgcsv_sync_log") \
         .select("created_at") \
         .eq("status", "success") \
@@ -102,53 +97,19 @@ async def check_last_updated(session: aiohttp.ClientSession, supabase: Client) -
         .execute()
 
     if not result.data:
-        log.info("No previous successful sync found — proceeding")
+        log.info("No previous sync found — proceeding")
         return True
 
     last_sync = result.data[0]["created_at"]
-    log.info(f"Our last successful sync: {last_sync}")
-
-    # Store remote_ts in sync_log notes for next comparison
-    # Simple check: if remote_ts timestamp is newer than our last sync, proceed
     if remote_ts > last_sync[:len(remote_ts)]:
-        log.info("TCGCSV has newer data — proceeding with sync")
+        log.info("TCGCSV has newer data — proceeding")
         return True
     else:
-        log.info("Already up to date — skipping sync")
+        log.info("Already up to date — skipping")
         return False
 
 
-# ── Supabase upsert helpers ───────────────────────────────────────────────────
-def upsert_batched(supabase: Client, table: str, rows: list[dict],
-                   conflict_cols: str) -> int:
-    """Upsert rows in batches of BATCH_SIZE. Returns total rows processed."""
-    if not rows:
-        return 0
-    total = 0
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
-        supabase.table(table).upsert(batch, on_conflict=conflict_cols).execute()
-        total += len(batch)
-    return total
-
-
-def insert_ignore_batched(supabase: Client, table: str, rows: list[dict]) -> int:
-    """Insert rows, ignoring conflicts. Returns total rows processed."""
-    if not rows:
-        return 0
-    total = 0
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
-        supabase.table(table).upsert(
-            batch,
-            on_conflict="product_id,sub_type,price_date",
-            ignore_duplicates=True,
-        ).execute()
-        total += len(batch)
-    return total
-
-
-# ── Data transformation ───────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def safe_str(val) -> str | None:
     if pd.isna(val) or val == "" or val == "nan":
         return None
@@ -163,24 +124,90 @@ def safe_numeric(val) -> float | None:
         return None
 
 
-def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tuple[list, list, list]:
+def upsert_batched(supabase: Client, table: str, rows: list[dict],
+                   conflict_cols: str) -> int:
+    if not rows:
+        return 0
+    total = 0
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = rows[i : i + BATCH_SIZE]
+        supabase.table(table).upsert(batch, on_conflict=conflict_cols).execute()
+        total += len(batch)
+    return total
+
+
+# ── Monthly checkpoint management ────────────────────────────────────────────
+def get_checkpoint_col(d: date) -> str:
+    """Return checkpoint column name for a given month, e.g. 'market_2026_04'"""
+    return f"market_{d.year}_{d.month:02d}"
+
+
+def ensure_checkpoint_column(supabase: Client, col_name: str) -> None:
+    """Add checkpoint column if it doesn't exist yet."""
+    try:
+        # Try a direct SQL alter via RPC — if column exists this will error
+        supabase.rpc("exec_sql", {
+            "query": f"ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {col_name} numeric;"
+        }).execute()
+        log.info(f"  Checkpoint column ensured: {col_name}")
+    except Exception as e:
+        log.warning(f"  Could not add checkpoint column {col_name}: {e}")
+
+
+# ── Price shift + write ───────────────────────────────────────────────────────
+def build_shift_sql(today: date) -> str:
     """
-    Parse a ProductsAndPrices DataFrame into three lists:
-      - product_rows   → tcgcsv_products upsert
-      - latest_rows    → tcgcsv_prices_latest upsert
-      - history_rows   → tcgcsv_prices_history insert-ignore
+    Build SQL that:
+    1. Shifts d1→d2, d2→d3 ... d28→d29 (drops d29, it's now 30 days old)
+    2. Writes market_price → market_d1 (yesterday becomes d1)
+    On 1st of month: also writes market_d1 → checkpoint column for last month
+    """
+    yesterday = today - timedelta(days=1)
+    last_month = (today.replace(day=1) - timedelta(days=1))  # last day of prev month
+    checkpoint_col = get_checkpoint_col(last_month)
+
+    # Build shift: d28→d29, d27→d28, ..., d1→d2
+    shifts = []
+    for i in range(29, 1, -1):
+        shifts.append(f"market_d{i} = market_d{i-1}")
+
+    # Yesterday's market price → d1
+    shifts.append("market_d1 = market_price")
+
+    # On 1st of month, snapshot yesterday's price into checkpoint
+    if today.day == 1:
+        shifts.append(f"{checkpoint_col} = market_price")
+        log.info(f"  Monthly checkpoint: writing to {checkpoint_col}")
+
+    shifts.append("last_updated = CURRENT_DATE")
+
+    return ", ".join(shifts)
+
+
+def write_prices_sql(today: date, price_rows: list[dict]) -> None:
+    """
+    We use raw SQL via Supabase RPC for the wide table upsert because
+    we need to shift columns atomically and write today's 5 fields.
+    Returns SQL string for batch execution.
+    """
+    pass  # handled via upsert_batched below
+
+
+def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tuple[list, list]:
+    """
+    Parse a ProductsAndPrices DataFrame.
+    Returns:
+      - product_rows  → tcgcsv_products upsert
+      - price_rows    → tcgcsv_prices_wide upsert
     """
     product_rows = []
-    latest_rows  = []
-    history_rows = []
+    price_rows   = []
 
-    # Normalize column names (files differ slightly in order)
     df.columns = [c.strip() for c in df.columns]
 
     required = {"productId", "subTypeName", "groupId"}
     if not required.issubset(df.columns):
-        log.warning(f"  Missing required columns: {required - set(df.columns)}")
-        return [], [], []
+        return [], []
 
     for _, row in df.iterrows():
         product_id   = safe_str(row.get("productId"))
@@ -191,8 +218,7 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
         if not product_id or not group_id:
             continue
 
-        # Skip rows with no subTypeName AND no prices — dead listings
-        # (code cards, unlisted blisters) that will never have market data.
+        # Skip dead listings (no subTypeName AND no prices)
         if sub_type_raw is None:
             price_vals = [row.get(c) for c in ("lowPrice", "midPrice", "highPrice", "marketPrice", "directLowPrice")]
             if all(safe_numeric(v) is None for v in price_vals):
@@ -201,7 +227,6 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
         product_id = int(product_id)
         group_id   = int(group_id)
 
-        # ── product record ──
         product_rows.append({
             "product_id":    product_id,
             "sub_type":      sub_type,
@@ -220,8 +245,7 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
             "updated_at":    "now()",
         })
 
-        # ── price records ──
-        price = {
+        price_rows.append({
             "product_id":   product_id,
             "sub_type":     sub_type,
             "low_price":    safe_numeric(row.get("lowPrice")),
@@ -229,31 +253,25 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
             "high_price":   safe_numeric(row.get("highPrice")),
             "market_price": safe_numeric(row.get("marketPrice")),
             "direct_low":   safe_numeric(row.get("directLowPrice")),
-            "price_date":   str(today),
-        }
+            "last_updated": str(today),
+        })
 
-        latest_rows.append({**price, "updated_at": "now()"})
-        history_rows.append(price)
-
-    return product_rows, latest_rows, history_rows
+    return product_rows, price_rows
 
 
-# ── Core per-group worker ─────────────────────────────────────────────────────
+# ── Per-group worker ──────────────────────────────────────────────────────────
 async def process_group(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
     category_id: int,
     group_id: str,
     today: date,
-) -> tuple[list, list, list]:
-    """Download one group's CSV and parse it. Returns (products, latest, history)."""
+) -> tuple[list, list]:
     url = f"{TCGCSV_BASE}/{category_id}/{group_id}/ProductsAndPrices.csv"
     async with semaphore:
         df = await fetch_csv(session, url)
-
     if df is None or df.empty:
-        return [], [], []
-
+        return [], []
     return parse_products_prices(df, category_id, today)
 
 
@@ -265,7 +283,6 @@ async def process_game(
     game_name: str,
     today: date,
 ) -> dict:
-    """Fetch all groups for a game, download all CSVs, upsert to Supabase."""
     log_entry = {
         "run_date":    str(today),
         "category_id": category_id,
@@ -274,12 +291,11 @@ async def process_game(
     }
     t0 = time.time()
 
-    # ── Discover groups ──
     groups_url = f"{TCGCSV_BASE}/{category_id}/Groups.csv"
     groups_df  = await fetch_csv(session, groups_url)
 
     if groups_df is None or groups_df.empty or "groupId" not in groups_df.columns:
-        log.error(f"  [{game_name}] Could not fetch groups from {groups_url}")
+        log.error(f"  [{game_name}] Could not fetch groups")
         log_entry["status"] = "error"
         log_entry["error_msg"] = "groups fetch failed"
         return log_entry
@@ -288,7 +304,6 @@ async def process_game(
     log.info(f"  [{game_name}] {len(group_ids)} groups discovered")
     log_entry["groups_fetched"] = len(group_ids)
 
-    # ── Download all groups concurrently ──
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
     tasks = [
         process_group(session, semaphore, category_id, gid, today)
@@ -297,25 +312,25 @@ async def process_game(
     results = await asyncio.gather(*tasks)
 
     all_products = []
-    all_latest   = []
-    all_history  = []
-    for prods, latest, history in results:
+    all_prices   = []
+    for prods, prices in results:
         all_products.extend(prods)
-        all_latest.extend(latest)
-        all_history.extend(history)
+        all_prices.extend(prices)
 
-    log.info(f"  [{game_name}] {len(all_products):,} product rows, {len(all_latest):,} price rows")
+    log.info(f"  [{game_name}] {len(all_products):,} products, {len(all_prices):,} price rows")
 
-    # ── Upsert to Supabase ──
-    upsert_batched(supabase, "tcgcsv_products",      all_products, "product_id,sub_type")
-    upsert_batched(supabase, "tcgcsv_prices_latest", all_latest,   "product_id,sub_type")
-    insert_ignore_batched(supabase, "tcgcsv_prices_history", all_history)
+    # Upsert products (metadata)
+    upsert_batched(supabase, "tcgcsv_products", all_products, "product_id,sub_type")
 
-    log_entry["rows_upserted"]    = len(all_latest)
+    # Upsert prices into wide table
+    # On conflict: shift day columns, update today's 5 fields
+    # We use a custom upsert that sets the shift via the merge_duplicates logic
+    upsert_wide_prices(supabase, all_prices, today)
+
+    log_entry["rows_upserted"]    = len(all_prices)
     log_entry["duration_seconds"] = round(time.time() - t0, 1)
     log_entry["status"]           = "success"
 
-    # ── Update last_synced_at in config ──
     supabase.table("tcgcsv_sync_config").update({
         "last_synced_at": "now()",
         "group_count":    len(group_ids),
@@ -325,25 +340,120 @@ async def process_game(
     return log_entry
 
 
-# ── History maintenance ───────────────────────────────────────────────────────
-def maintain_history(supabase: Client, today: date) -> None:
+# ── Wide table upsert with column shift ──────────────────────────────────────
+def upsert_wide_prices(supabase: Client, price_rows: list[dict], today: date) -> None:
     """
-    1. On 1st of month: mark yesterday's rows as monthly checkpoints.
-    2. Delete rows older than HISTORY_DAYS that are not checkpoints.
+    Upsert into tcgcsv_prices_wide.
+    - New rows: insert with today's 5 fields, all day columns null
+    - Existing rows: shift d1→d2...d28→d29, today's market→d1, write new 5 fields
+    We do this via raw SQL in batches for performance.
     """
-    yesterday = today - timedelta(days=1)
-    cutoff    = today - timedelta(days=HISTORY_DAYS)
+    if not price_rows:
+        return
 
-    if today.day == 1:
-        log.info(f"  Marking {yesterday} as monthly checkpoint...")
-        supabase.table("tcgcsv_prices_history").update({"is_checkpoint": True}).eq(
-            "price_date", str(yesterday)
-        ).eq("is_checkpoint", False).execute()
+    yesterday   = today - timedelta(days=1)
+    last_month  = (today.replace(day=1) - timedelta(days=1))
+    chk_col     = get_checkpoint_col(last_month)
+    is_month_1  = today.day == 1
 
-    log.info(f"  Purging history older than {cutoff} (non-checkpoints)...")
-    supabase.table("tcgcsv_prices_history").delete().lt(
-        "price_date", str(cutoff)
-    ).eq("is_checkpoint", False).execute()
+    # Build the ON CONFLICT UPDATE shift expression
+    shift_parts = []
+    for i in range(29, 1, -1):
+        shift_parts.append(f"market_d{i} = EXCLUDED.market_d{i-1} -- will be set from existing")
+
+    # We do this properly: fetch existing market_price for these product_ids,
+    # then build upsert rows that include the shifted values.
+    # For simplicity and performance, use a SQL UPDATE after insert.
+
+    for i in range(0, len(price_rows), BATCH_SIZE):
+        batch = price_rows[i : i + BATCH_SIZE]
+
+        # Step 1: Insert new rows (new products get today's prices, no history)
+        insert_rows = [{
+            "product_id":   r["product_id"],
+            "sub_type":     r["sub_type"],
+            "low_price":    r["low_price"],
+            "mid_price":    r["mid_price"],
+            "high_price":   r["high_price"],
+            "market_price": r["market_price"],
+            "direct_low":   r["direct_low"],
+            "last_updated": r["last_updated"],
+        } for r in batch]
+
+        # Step 2: For existing rows, use upsert but we need the shift
+        # Build upsert with explicit conflict handling via SQL
+        product_ids = [r["product_id"] for r in batch]
+        sub_types   = list({r["sub_type"] for r in batch})
+
+        # Fetch current market prices to use as d1
+        existing = supabase.table("tcgcsv_prices_wide") \
+            .select("product_id,sub_type,market_price,market_d1,market_d2,market_d3,market_d4,market_d5,market_d6,market_d7,market_d8,market_d9,market_d10,market_d11,market_d12,market_d13,market_d14,market_d15,market_d16,market_d17,market_d18,market_d19,market_d20,market_d21,market_d22,market_d23,market_d24,market_d25,market_d26,market_d27,market_d28") \
+            .in_("product_id", product_ids) \
+            .execute()
+
+        existing_map = {
+            (r["product_id"], r["sub_type"]): r
+            for r in (existing.data or [])
+        }
+
+        upsert_rows = []
+        for r in batch:
+            key = (r["product_id"], r["sub_type"])
+            ex  = existing_map.get(key)
+
+            row = {
+                "product_id":   r["product_id"],
+                "sub_type":     r["sub_type"],
+                "low_price":    r["low_price"],
+                "mid_price":    r["mid_price"],
+                "high_price":   r["high_price"],
+                "market_price": r["market_price"],
+                "direct_low":   r["direct_low"],
+                "last_updated": r["last_updated"],
+            }
+
+            if ex:
+                # Shift existing day columns
+                row["market_d1"]  = ex.get("market_price")   # yesterday → d1
+                row["market_d2"]  = ex.get("market_d1")
+                row["market_d3"]  = ex.get("market_d2")
+                row["market_d4"]  = ex.get("market_d3")
+                row["market_d5"]  = ex.get("market_d4")
+                row["market_d6"]  = ex.get("market_d5")
+                row["market_d7"]  = ex.get("market_d6")
+                row["market_d8"]  = ex.get("market_d7")
+                row["market_d9"]  = ex.get("market_d8")
+                row["market_d10"] = ex.get("market_d9")
+                row["market_d11"] = ex.get("market_d10")
+                row["market_d12"] = ex.get("market_d11")
+                row["market_d13"] = ex.get("market_d12")
+                row["market_d14"] = ex.get("market_d13")
+                row["market_d15"] = ex.get("market_d14")
+                row["market_d16"] = ex.get("market_d15")
+                row["market_d17"] = ex.get("market_d16")
+                row["market_d18"] = ex.get("market_d17")
+                row["market_d19"] = ex.get("market_d18")
+                row["market_d20"] = ex.get("market_d19")
+                row["market_d21"] = ex.get("market_d20")
+                row["market_d22"] = ex.get("market_d21")
+                row["market_d23"] = ex.get("market_d22")
+                row["market_d24"] = ex.get("market_d23")
+                row["market_d25"] = ex.get("market_d24")
+                row["market_d26"] = ex.get("market_d25")
+                row["market_d27"] = ex.get("market_d26")
+                row["market_d28"] = ex.get("market_d27")
+                row["market_d29"] = ex.get("market_d28")
+                # d29 is dropped (>30 days old)
+
+                # Monthly checkpoint on 1st of month
+                if is_month_1:
+                    row[chk_col] = ex.get("market_price")
+
+            upsert_rows.append(row)
+
+        supabase.table("tcgcsv_prices_wide").upsert(
+            upsert_rows, on_conflict="product_id,sub_type"
+        ).execute()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -353,18 +463,29 @@ async def main():
 
     log.info(f"=== TCGCSV ingest starting — {today} ===")
 
+    # On 1st of month, ensure this month's checkpoint column exists
+    if today.day == 1:
+        last_month  = (today.replace(day=1) - timedelta(days=1))
+        chk_col     = get_checkpoint_col(last_month)
+        log.info(f"First of month — ensuring checkpoint column: {chk_col}")
+        try:
+            supabase.rpc("exec_sql", {
+                "query": f"ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {chk_col} numeric;"
+            }).execute()
+        except Exception as e:
+            log.warning(f"Could not add checkpoint column via RPC: {e}")
+            log.warning("Please add manually: ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {chk_col} numeric;")
+
     headers   = {"User-Agent": USER_AGENT}
     connector = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS + 5)
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
 
-        # ── Check if TCGCSV has new data since our last sync ──
         should_sync = await check_last_updated(session, supabase)
         if not should_sync:
             log.info("Nothing to do — exiting.")
             return
 
-        # ── Load active games ordered by priority ──
         config_resp = (
             supabase.table("tcgcsv_sync_config")
             .select("category_id, game_name")
@@ -394,10 +515,6 @@ async def main():
                 }
 
             supabase.table("tcgcsv_sync_log").insert(log_entry).execute()
-
-    # ── History maintenance after all games done ──
-    log.info("\n── History maintenance ──")
-    maintain_history(supabase, today)
 
     log.info("\n=== TCGCSV ingest complete ===")
 

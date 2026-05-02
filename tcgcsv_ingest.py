@@ -123,6 +123,10 @@ def safe_numeric(val) -> float | None:
     except (ValueError, TypeError):
         return None
 
+def safe_bool(val) -> bool | None:
+    if pd.isna(val) or val == "" or val == "nan":
+        return None
+    return str(val).strip().lower() == "true"
 
 def upsert_batched(supabase: Client, table: str, rows: list[dict],
                    conflict_cols: str) -> int:
@@ -276,6 +280,23 @@ async def process_group(
 
 
 # ── Per-game orchestration ────────────────────────────────────────────────────
+def upsert_groups(supabase: Client, groups_df: pd.DataFrame, category_id: int) -> int:
+    rows = []
+    for _, row in groups_df.iterrows():
+        gid = safe_str(row.get("groupId"))
+        if not gid:
+            continue
+        rows.append({
+            "group_id":        int(gid),
+            "name":            safe_str(row.get("name")),
+            "abbreviation":    safe_str(row.get("abbreviation")),
+            "is_supplemental": safe_bool(row.get("isSupplemental")),
+            "published_on":    safe_str(row.get("publishedOn")),
+            "modified_on":     safe_str(row.get("modifiedOn")),
+            "category_id":     category_id,
+        })
+    return upsert_batched(supabase, "tcgcsv_groups", rows, "group_id")
+
 async def process_game(
     session: aiohttp.ClientSession,
     supabase: Client,
@@ -299,6 +320,9 @@ async def process_game(
         log_entry["status"] = "error"
         log_entry["error_msg"] = "groups fetch failed"
         return log_entry
+
+    groups_upserted = upsert_groups(supabase, groups_df, category_id)
+    log.info(f"  [{game_name}] Upserted {groups_upserted} groups")  
 
     group_ids = groups_df["groupId"].dropna().astype(str).tolist()
     log.info(f"  [{game_name}] {len(group_ids)} groups discovered")

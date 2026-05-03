@@ -5,20 +5,23 @@ Daily ingest of TCGplayer prices via TCGCSV.com into Supabase.
 
 Flow:
   1. Check last-updated.txt — skip if already synced today
-  2. Load active games from tcgcsv_sync_config
-  3. For each game, fetch Groups.csv to discover all set IDs dynamically
-  4. Download each group's ProductsAndPrices.csv (async, 20 concurrent)
-  5. Upsert products → tcgcsv_products
-  6. Shift price columns → tcgcsv_prices_wide (d1→d2, d2→d3 ... d28→d29)
-  7. Write today's 5 price fields → tcgcsv_prices_wide
-  8. On 1st of month: add new checkpoint column + populate from market_d1
+  2. SHIFT:  One SQL UPDATE moves all market_d columns forward one day for
+             every row in tcgcsv_prices_wide, unconditionally:
+               market_d29 <- market_d28 <- ... <- market_d1 <- market_price
+             market_price is then set to NULL, ready for today's value.
+  3. Load active games from tcgcsv_sync_config
+  4. For each game, fetch Groups.csv → upsert tcgcsv_groups
+  5. Download each group's ProductsAndPrices.csv (async, 20 concurrent)
+  6. Upsert products → tcgcsv_products
+  7. Upsert today's 5 price fields → tcgcsv_prices_wide by product_id+sub_type
+     New cards get a fresh row. Existing cards get today's prices written on
+     top of already-shifted columns. Cards not in feed stay NULL — correct.
+  8. On 1st of month: add new checkpoint column + populate from market_price
   9. Log run stats to tcgcsv_sync_log
 
 Environment variables required:
   SUPABASE_URL
   SUPABASE_SERVICE_KEY
-
-Run:  python tcgcsv_ingest.py
 """
 
 import asyncio
@@ -32,15 +35,15 @@ import aiohttp
 import pandas as pd
 from supabase import create_client, Client
 
-# ── Config ───────────────────────────────────────────────────────────────────
-SUPABASE_URL        = os.environ["SUPABASE_URL"]
+# ── Config ────────────────────────────────────────────────────────────────────
+SUPABASE_URL        = os.environ.get("SUPABASE_URL", "https://ndeklcgjbejrhoujkatn.supabase.co")
 SUPABASE_KEY        = os.environ["SUPABASE_SERVICE_KEY"]
 TCGCSV_BASE         = "https://tcgcsv.com/tcgplayer"
 TCGCSV_LAST_UPDATED = "https://tcgcsv.com/last-updated.txt"
 CONCURRENT_REQUESTS = 20
 BATCH_SIZE          = 500
 REQUEST_TIMEOUT     = 30
-REQUEST_SLEEP       = 0.10         # 100ms between requests per usage guidelines
+REQUEST_SLEEP       = 0.10
 USER_AGENT          = "GIGA/1.0.0"
 
 logging.basicConfig(
@@ -49,9 +52,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# Rolling day columns d1-d29 (d1 = yesterday, d29 = 29 days ago)
-DAY_COLS = [f"market_d{i}" for i in range(1, 30)]
 
 
 # ── Supabase client ───────────────────────────────────────────────────────────
@@ -123,10 +123,12 @@ def safe_numeric(val) -> float | None:
     except (ValueError, TypeError):
         return None
 
+
 def safe_bool(val) -> bool | None:
     if pd.isna(val) or val == "" or val == "nan":
         return None
     return str(val).strip().lower() == "true"
+
 
 def upsert_batched(supabase: Client, table: str, rows: list[dict],
                    conflict_cols: str) -> int:
@@ -134,76 +136,75 @@ def upsert_batched(supabase: Client, table: str, rows: list[dict],
         return 0
     total = 0
     for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i : i + BATCH_SIZE]
+        batch = rows[i:i + BATCH_SIZE]
         supabase.table(table).upsert(batch, on_conflict=conflict_cols).execute()
         total += len(batch)
     return total
 
 
-# ── Monthly checkpoint management ────────────────────────────────────────────
-def get_checkpoint_col(d: date) -> str:
-    """Return checkpoint column name for a given month, e.g. 'market_2026_04'"""
-    return f"market_{d.year}_{d.month:02d}"
+# ── Step 1: SQL shift ─────────────────────────────────────────────────────────
+def shift_all_prices(supabase: Client, today: date) -> None:
+    """
+    Move every market_d column forward one day for all rows in tcgcsv_prices_wide.
+    market_price -> market_d1 -> market_d2 -> ... -> market_d29 (d29 is dropped).
+    market_price is set to NULL after shifting — today's upsert writes the new value.
+    Cards not in today's feed keep their shifted NULLs — correct.
+    On 1st of month, also snapshot market_price into last month's checkpoint column.
+    """
+    log.info("Shifting all price columns forward one day...")
+
+    last_month  = (today.replace(day=1) - timedelta(days=1))
+    chk_col     = f"market_{last_month.year}_{last_month.month:02d}"
+
+    shift_parts = []
+    for i in range(29, 1, -1):
+        shift_parts.append(f"market_d{i} = market_d{i-1}")
+    shift_parts.append("market_d1 = market_price")
+    shift_parts.append("market_price = NULL")
+    shift_parts.append("last_updated = CURRENT_DATE")
+
+    # On 1st of month, snapshot yesterday's price into checkpoint before clearing
+    if today.day == 1:
+        shift_parts.append(f"{chk_col} = market_price")
+        log.info(f"  Monthly checkpoint: writing to {chk_col}")
+
+    sql = f"UPDATE tcgcsv_prices_wide SET {', '.join(shift_parts)}"
+    supabase.rpc("exec_sql", {"query": sql}).execute()
+    log.info("Price shift complete.")
 
 
+# ── Monthly checkpoint column ─────────────────────────────────────────────────
 def ensure_checkpoint_column(supabase: Client, col_name: str) -> None:
-    """Add checkpoint column if it doesn't exist yet."""
     try:
-        # Try a direct SQL alter via RPC — if column exists this will error
         supabase.rpc("exec_sql", {
             "query": f"ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {col_name} numeric;"
         }).execute()
-        log.info(f"  Checkpoint column ensured: {col_name}")
+        log.info(f"Checkpoint column ensured: {col_name}")
     except Exception as e:
-        log.warning(f"  Could not add checkpoint column {col_name}: {e}")
+        log.warning(f"Could not add checkpoint column {col_name}: {e}")
 
 
-# ── Price shift + write ───────────────────────────────────────────────────────
-def build_shift_sql(today: date) -> str:
-    """
-    Build SQL that:
-    1. Shifts d1→d2, d2→d3 ... d28→d29 (drops d29, it's now 30 days old)
-    2. Writes market_price → market_d1 (yesterday becomes d1)
-    On 1st of month: also writes market_d1 → checkpoint column for last month
-    """
-    yesterday = today - timedelta(days=1)
-    last_month = (today.replace(day=1) - timedelta(days=1))  # last day of prev month
-    checkpoint_col = get_checkpoint_col(last_month)
-
-    # Build shift: d28→d29, d27→d28, ..., d1→d2
-    shifts = []
-    for i in range(29, 1, -1):
-        shifts.append(f"market_d{i} = market_d{i-1}")
-
-    # Yesterday's market price → d1
-    shifts.append("market_d1 = market_price")
-
-    # On 1st of month, snapshot yesterday's price into checkpoint
-    if today.day == 1:
-        shifts.append(f"{checkpoint_col} = market_price")
-        log.info(f"  Monthly checkpoint: writing to {checkpoint_col}")
-
-    shifts.append("last_updated = CURRENT_DATE")
-
-    return ", ".join(shifts)
+# ── Groups upsert ─────────────────────────────────────────────────────────────
+def upsert_groups(supabase: Client, groups_df: pd.DataFrame, category_id: int) -> int:
+    rows = []
+    for _, row in groups_df.iterrows():
+        gid = safe_str(row.get("groupId"))
+        if not gid:
+            continue
+        rows.append({
+            "group_id":        int(gid),
+            "name":            safe_str(row.get("name")),
+            "abbreviation":    safe_str(row.get("abbreviation")),
+            "is_supplemental": safe_bool(row.get("isSupplemental")),
+            "published_on":    safe_str(row.get("publishedOn")),
+            "modified_on":     safe_str(row.get("modifiedOn")),
+            "category_id":     category_id,
+        })
+    return upsert_batched(supabase, "tcgcsv_groups", rows, "group_id")
 
 
-def write_prices_sql(today: date, price_rows: list[dict]) -> None:
-    """
-    We use raw SQL via Supabase RPC for the wide table upsert because
-    we need to shift columns atomically and write today's 5 fields.
-    Returns SQL string for batch execution.
-    """
-    pass  # handled via upsert_batched below
-
-
+# ── Parse products + prices ───────────────────────────────────────────────────
 def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tuple[list, list]:
-    """
-    Parse a ProductsAndPrices DataFrame.
-    Returns:
-      - product_rows  → tcgcsv_products upsert
-      - price_rows    → tcgcsv_prices_wide upsert
-    """
     product_rows = []
     price_rows   = []
 
@@ -249,6 +250,7 @@ def parse_products_prices(df: pd.DataFrame, category_id: int, today: date) -> tu
             "updated_at":    "now()",
         })
 
+        # Only write today's 5 price fields — shift already happened via SQL
         price_rows.append({
             "product_id":   product_id,
             "sub_type":     sub_type,
@@ -280,23 +282,6 @@ async def process_group(
 
 
 # ── Per-game orchestration ────────────────────────────────────────────────────
-def upsert_groups(supabase: Client, groups_df: pd.DataFrame, category_id: int) -> int:
-    rows = []
-    for _, row in groups_df.iterrows():
-        gid = safe_str(row.get("groupId"))
-        if not gid:
-            continue
-        rows.append({
-            "group_id":        int(gid),
-            "name":            safe_str(row.get("name")),
-            "abbreviation":    safe_str(row.get("abbreviation")),
-            "is_supplemental": safe_bool(row.get("isSupplemental")),
-            "published_on":    safe_str(row.get("publishedOn")),
-            "modified_on":     safe_str(row.get("modifiedOn")),
-            "category_id":     category_id,
-        })
-    return upsert_batched(supabase, "tcgcsv_groups", rows, "group_id")
-
 async def process_game(
     session: aiohttp.ClientSession,
     supabase: Client,
@@ -317,12 +302,12 @@ async def process_game(
 
     if groups_df is None or groups_df.empty or "groupId" not in groups_df.columns:
         log.error(f"  [{game_name}] Could not fetch groups")
-        log_entry["status"] = "error"
+        log_entry["status"]    = "error"
         log_entry["error_msg"] = "groups fetch failed"
         return log_entry
 
     groups_upserted = upsert_groups(supabase, groups_df, category_id)
-    log.info(f"  [{game_name}] Upserted {groups_upserted} groups")  
+    log.info(f"  [{game_name}] Upserted {groups_upserted} groups")
 
     group_ids = groups_df["groupId"].dropna().astype(str).tolist()
     log.info(f"  [{game_name}] {len(group_ids)} groups discovered")
@@ -343,13 +328,8 @@ async def process_game(
 
     log.info(f"  [{game_name}] {len(all_products):,} products, {len(all_prices):,} price rows")
 
-    # Upsert products (metadata)
     upsert_batched(supabase, "tcgcsv_products", all_products, "product_id,sub_type")
-
-    # Upsert prices into wide table
-    # On conflict: shift day columns, update today's 5 fields
-    # We use a custom upsert that sets the shift via the merge_duplicates logic
-    upsert_wide_prices(supabase, all_prices, today)
+    upsert_batched(supabase, "tcgcsv_prices_wide", all_prices, "product_id,sub_type")
 
     log_entry["rows_upserted"]    = len(all_prices)
     log_entry["duration_seconds"] = round(time.time() - t0, 1)
@@ -364,141 +344,12 @@ async def process_game(
     return log_entry
 
 
-# ── Wide table upsert with column shift ──────────────────────────────────────
-def upsert_wide_prices(supabase: Client, price_rows: list[dict], today: date) -> None:
-    """
-    Upsert into tcgcsv_prices_wide.
-    - New rows: insert with today's 5 fields, all day columns null
-    - Existing rows: shift d1→d2...d28→d29, today's market→d1, write new 5 fields
-    We do this via raw SQL in batches for performance.
-    """
-    if not price_rows:
-        return
-
-    yesterday   = today - timedelta(days=1)
-    last_month  = (today.replace(day=1) - timedelta(days=1))
-    chk_col     = get_checkpoint_col(last_month)
-    is_month_1  = today.day == 1
-
-    # Build the ON CONFLICT UPDATE shift expression
-    shift_parts = []
-    for i in range(29, 1, -1):
-        shift_parts.append(f"market_d{i} = EXCLUDED.market_d{i-1} -- will be set from existing")
-
-    # We do this properly: fetch existing market_price for these product_ids,
-    # then build upsert rows that include the shifted values.
-    # For simplicity and performance, use a SQL UPDATE after insert.
-
-    for i in range(0, len(price_rows), BATCH_SIZE):
-        batch = price_rows[i : i + BATCH_SIZE]
-
-        # Step 1: Insert new rows (new products get today's prices, no history)
-        insert_rows = [{
-            "product_id":   r["product_id"],
-            "sub_type":     r["sub_type"],
-            "low_price":    r["low_price"],
-            "mid_price":    r["mid_price"],
-            "high_price":   r["high_price"],
-            "market_price": r["market_price"],
-            "direct_low":   r["direct_low"],
-            "last_updated": r["last_updated"],
-        } for r in batch]
-
-        # Step 2: For existing rows, use upsert but we need the shift
-        # Build upsert with explicit conflict handling via SQL
-        product_ids = [r["product_id"] for r in batch]
-        sub_types   = list({r["sub_type"] for r in batch})
-
-        # Fetch current market prices to use as d1
-        existing = supabase.table("tcgcsv_prices_wide") \
-            .select("product_id,sub_type,market_price,market_d1,market_d2,market_d3,market_d4,market_d5,market_d6,market_d7,market_d8,market_d9,market_d10,market_d11,market_d12,market_d13,market_d14,market_d15,market_d16,market_d17,market_d18,market_d19,market_d20,market_d21,market_d22,market_d23,market_d24,market_d25,market_d26,market_d27,market_d28") \
-            .in_("product_id", product_ids) \
-            .execute()
-
-        existing_map = {
-            (r["product_id"], r["sub_type"]): r
-            for r in (existing.data or [])
-        }
-
-        upsert_rows = []
-        for r in batch:
-            key = (r["product_id"], r["sub_type"])
-            ex  = existing_map.get(key)
-
-            row = {
-                "product_id":   r["product_id"],
-                "sub_type":     r["sub_type"],
-                "low_price":    r["low_price"],
-                "mid_price":    r["mid_price"],
-                "high_price":   r["high_price"],
-                "market_price": r["market_price"],
-                "direct_low":   r["direct_low"],
-                "last_updated": r["last_updated"],
-            }
-
-            if ex:
-                # Shift existing day columns
-                row["market_d1"]  = ex.get("market_price")   # yesterday → d1
-                row["market_d2"]  = ex.get("market_d1")
-                row["market_d3"]  = ex.get("market_d2")
-                row["market_d4"]  = ex.get("market_d3")
-                row["market_d5"]  = ex.get("market_d4")
-                row["market_d6"]  = ex.get("market_d5")
-                row["market_d7"]  = ex.get("market_d6")
-                row["market_d8"]  = ex.get("market_d7")
-                row["market_d9"]  = ex.get("market_d8")
-                row["market_d10"] = ex.get("market_d9")
-                row["market_d11"] = ex.get("market_d10")
-                row["market_d12"] = ex.get("market_d11")
-                row["market_d13"] = ex.get("market_d12")
-                row["market_d14"] = ex.get("market_d13")
-                row["market_d15"] = ex.get("market_d14")
-                row["market_d16"] = ex.get("market_d15")
-                row["market_d17"] = ex.get("market_d16")
-                row["market_d18"] = ex.get("market_d17")
-                row["market_d19"] = ex.get("market_d18")
-                row["market_d20"] = ex.get("market_d19")
-                row["market_d21"] = ex.get("market_d20")
-                row["market_d22"] = ex.get("market_d21")
-                row["market_d23"] = ex.get("market_d22")
-                row["market_d24"] = ex.get("market_d23")
-                row["market_d25"] = ex.get("market_d24")
-                row["market_d26"] = ex.get("market_d25")
-                row["market_d27"] = ex.get("market_d26")
-                row["market_d28"] = ex.get("market_d27")
-                row["market_d29"] = ex.get("market_d28")
-                # d29 is dropped (>30 days old)
-
-                # Monthly checkpoint on 1st of month
-                if is_month_1:
-                    row[chk_col] = ex.get("market_price")
-
-            upsert_rows.append(row)
-
-        supabase.table("tcgcsv_prices_wide").upsert(
-            upsert_rows, on_conflict="product_id,sub_type"
-        ).execute()
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     today    = date.today()
     supabase = get_supabase()
 
     log.info(f"=== TCGCSV ingest starting — {today} ===")
-
-    # On 1st of month, ensure this month's checkpoint column exists
-    if today.day == 1:
-        last_month  = (today.replace(day=1) - timedelta(days=1))
-        chk_col     = get_checkpoint_col(last_month)
-        log.info(f"First of month — ensuring checkpoint column: {chk_col}")
-        try:
-            supabase.rpc("exec_sql", {
-                "query": f"ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {chk_col} numeric;"
-            }).execute()
-        except Exception as e:
-            log.warning(f"Could not add checkpoint column via RPC: {e}")
-            log.warning("Please add manually: ALTER TABLE tcgcsv_prices_wide ADD COLUMN IF NOT EXISTS {chk_col} numeric;")
 
     headers   = {"User-Agent": USER_AGENT}
     connector = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS + 5)
@@ -509,6 +360,16 @@ async def main():
         if not should_sync:
             log.info("Nothing to do — exiting.")
             return
+
+        # On 1st of month, ensure last month's checkpoint column exists
+        if today.day == 1:
+            last_month = (today.replace(day=1) - timedelta(days=1))
+            chk_col    = f"market_{last_month.year}_{last_month.month:02d}"
+            log.info(f"First of month — ensuring checkpoint column: {chk_col}")
+            ensure_checkpoint_column(supabase, chk_col)
+
+        # Step 1: Shift all prices forward one day
+        shift_all_prices(supabase, today)
 
         config_resp = (
             supabase.table("tcgcsv_sync_config")
